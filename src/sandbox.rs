@@ -40,7 +40,7 @@ pub enum Error {
     #[snafu(display("Unable to remove the compiler: {}", source))]
     UnableToRemoveCompiler { source: io::Error },
     #[snafu(display("Compiler execution took longer than {} ms", timeout.as_millis()))]
-    CompilerExecutionTimedOut { source: tokio::time::Elapsed, timeout: Duration },
+    CompilerExecutionTimedOut { source: tokio::time::error::Elapsed, timeout: Duration },
 
     #[snafu(display("Unable to read output file: {}", source))]
     UnableToReadOutput { source: io::Error },
@@ -77,7 +77,7 @@ pub struct Sandbox {
 fn wide_open_permissions() -> Option<std::fs::Permissions> {
     #[cfg(target_os = "linux")]
         {
-            use std::os::unix::permissions::PermissionsExt;
+            use std::os::unix::fs::permissions::PermissionsExt;
             Some(PermissionsExt::from_mode(0o777))
         }
 
