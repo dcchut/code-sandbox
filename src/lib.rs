@@ -69,7 +69,7 @@ pub struct Sandbox {
 fn wide_open_permissions() -> Option<std::fs::Permissions> {
     #[cfg(target_os = "linux")]
     {
-        use std::os::unix::fs::permissions::PermissionsExt;
+        use std::os::unix::fs::PermissionsExt;
         Some(PermissionsExt::from_mode(0o777))
     }
 
