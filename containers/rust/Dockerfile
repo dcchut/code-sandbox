@@ -1,22 +1,13 @@
-FROM ubuntu:20.04 as toolchain
+FROM bitnami/minideb:latest as toolchain
 
 ARG channel
 
 ENV DEBIAN_FRONTEND="noninteractive"
 
-# `build-essential` and `file` are needed for backtrace-sys
-# `cmake`, `git`, `python` are needed for wasm tools
-# cmake \
-#    curl \
-#    file \
-#    gcc \
-#    git \
-#    libssl-dev \
-#    pkg-config \
-#    python \
-RUN apt-get update && apt-get install -y \
-    curl \
- && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && \
+    apt-get install ca-certificates -y && \
+    update-ca-certificates && \
+    install_packages curl build-essential
 
 RUN useradd -m playground -d /playground
 RUN usermod -p '!!' root # Disable all passwords for root
@@ -31,7 +22,7 @@ WORKDIR /playground
 # installation of Rust.
 ADD --chown=playground https://static.rust-lang.org/rustup/release-stable.toml /playground/tools/rustup-manifest.toml
 ADD --chown=playground https://static.rust-lang.org/dist/channel-rust-${channel}-date.txt /playground/tools/rust-channel-version
-RUN curl https://sh.rustup.rs -sSf | sh -- -y --profile minimal --default-toolchain "${channel}"
+RUN curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal --default-toolchain "${channel}"
 ADD --chown=playground entrypoint.sh /playground/tools/
 
 # Fetch all the crate source files

@@ -83,6 +83,15 @@ pub enum Engine {
     Rust,
 }
 
+impl Engine {
+    fn docker_image(&self) -> &'static str {
+        match self {
+            Engine::Python => "code-sandbox-python",
+            Engine::Rust => "code-sandbox-rust-stable",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ExecuteRequest {
     pub code: String,
@@ -99,7 +108,7 @@ pub struct ExecuteResponse {
 impl Sandbox {
     pub fn new() -> Result<Self> {
         let scratch = TempDir::new("playground").context(UnableToCreateTempDir)?;
-        let input_file = scratch.path().join("input.rs");
+        let input_file = scratch.path().join("input");
         let output_dir = scratch.path().join("output");
 
         fs::create_dir(&output_dir).context(UnableToCreateOutputDir)?;
@@ -132,7 +141,7 @@ impl Sandbox {
 
     pub async fn execute(&self, req: &ExecuteRequest) -> Result<ExecuteResponse> {
         self.write_source_code(&req.code)?;
-        let command = self.execute_command();
+        let command = self.execute_command(req);
 
         let output = run_command_with_timeout(command).await?;
 
@@ -143,23 +152,31 @@ impl Sandbox {
         })
     }
 
-    fn execute_command(&self) -> Command {
-        let mut cmd = self.docker_command();
+    fn execute_command(&self, req: &ExecuteRequest) -> Command {
+        let mut cmd = self.docker_command(req);
         set_execution_environment(&mut cmd);
-        let execution_cmd = build_execution_command();
+        let execution_cmd = build_execution_command(req);
 
-        cmd.arg("shepmaster/rust-stable").args(&execution_cmd);
+        cmd.arg(req.engine.docker_image()).args(&execution_cmd);
 
         log::debug!("Execution command is {:?}", cmd);
 
         cmd
     }
 
-    fn docker_command(&self) -> Command {
+    fn docker_command(&self, req: &ExecuteRequest) -> Command {
         let mut mount_input_file = self.input_file.as_os_str().to_os_string();
         mount_input_file.push(":");
         mount_input_file.push("/playground/");
-        mount_input_file.push("src/main.rs");
+
+        match req.engine {
+            Engine::Python => {
+                mount_input_file.push("src/main.py");
+            },
+            Engine::Rust => {
+                mount_input_file.push("src/main.rs");
+            }
+        }
 
         let mut mount_output_dir = self.output_dir.as_os_str().to_os_string();
         mount_output_dir.push(":");
@@ -176,10 +193,20 @@ impl Sandbox {
     }
 }
 
-fn build_execution_command() -> Vec<&'static str> {
-    let mut cmd = vec!["cargo"];
-    cmd.push("run");
-    cmd.push("--release");
+fn build_execution_command(req: &ExecuteRequest) -> Vec<&'static str> {
+    let mut cmd = vec![];
+
+    match req.engine {
+        Engine::Python => {
+            cmd.push("python3");
+            cmd.push("/playground/src/main.py")
+        },
+        Engine::Rust => {
+            cmd.push("cargo");
+            cmd.push("run");
+            // cmd.push("--release")
+        },
+    }
 
     cmd
 }
