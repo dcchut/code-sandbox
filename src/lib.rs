@@ -206,7 +206,7 @@ fn build_execution_command(req: &ExecuteRequest) -> Vec<&'static str> {
         Engine::Rust => {
             cmd.push("cargo");
             cmd.push("run");
-            // cmd.push("--release")
+            cmd.push("--release");
         }
     }
 
