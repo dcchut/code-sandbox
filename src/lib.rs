@@ -1,53 +1,51 @@
-use snafu::{OptionExt, ResultExt, Snafu};
 use std::{fs, io, path::PathBuf, string, time::Duration};
 use tempdir::TempDir;
+use thiserror::Error;
 use tokio::process::Command;
 
 const DOCKER_PROCESS_TIMEOUT_SOFT: Duration = Duration::from_secs(4);
 const DOCKER_PROCESS_TIMEOUT_HARD: Duration = Duration::from_secs(8);
 
-#[derive(Debug, Snafu)]
+#[derive(Error, Debug)]
 pub enum Error {
-    #[snafu(display("Unable to create temporary directory: {}", source))]
+    #[error("Unable to create temporary directory: {source}")]
     UnableToCreateTempDir { source: io::Error },
-    #[snafu(display("Unable to create output directory: {}", source))]
+    #[error("Unable to create output directory: {source}")]
     UnableToCreateOutputDir { source: io::Error },
-    #[snafu(display("Unable to set permissions for output directory: {}", source))]
+    #[error("Unable to set permissions for output directory: {source}")]
     UnableToSetOutputPermissions { source: io::Error },
-    #[snafu(display("Unable to create source file: {}", source))]
+    #[error("Unable to create source file: {source}")]
     UnableToCreateSourceFile { source: io::Error },
-    #[snafu(display("Unable to set permissions for source file: {}", source))]
+    #[error("Unable to set pemissions for source file: {source}")]
     UnableToSetSourcePermissions { source: io::Error },
-
-    #[snafu(display("Unable to start the compiler: {}", source))]
+    #[error("Unable to start the compiler: {source}")]
     UnableToStartCompiler { source: io::Error },
-    #[snafu(display("Unable to find the compiler ID"))]
+    #[error("Unable to find the compiler ID")]
     MissingCompilerId,
-    #[snafu(display("Unable to wait for the compiler: {}", source))]
+    #[error("Unable to wait for the compiler: {source}")]
     UnableToWaitForCompiler { source: io::Error },
-    #[snafu(display("Unable to get output from the compiler: {}", source))]
+    #[error("Unable to get output from the compiler: {source}")]
     UnableToGetOutputFromCompiler { source: io::Error },
-    #[snafu(display("Unable to remove the compiler: {}", source))]
+    #[error("Unable to remove the compiler: {source}")]
     UnableToRemoveCompiler { source: io::Error },
-    #[snafu(display("Compiler execution took longer than {} ms", timeout.as_millis()))]
+    #[error("Compiler execution took longer than {} ms", timeout.as_millis())]
     CompilerExecutionTimedOut {
         source: tokio::time::error::Elapsed,
         timeout: Duration,
     },
-
-    #[snafu(display("Unable to read output file: {}", source))]
+    #[error("Unable to read output file: {source}")]
     UnableToReadOutput { source: io::Error },
-    #[snafu(display("Unable to read crate information: {}", source))]
+    #[error("Unable to read crate information: {source}")]
     UnableToParseCrateInformation { source: ::serde_json::Error },
-    #[snafu(display("Output was not valid UTF-8: {}", source))]
+    #[error("Output was not valid UTF-8: {source}")]
     OutputNotUtf8 { source: string::FromUtf8Error },
-    #[snafu(display("Output was missing"))]
+    #[error("Output was missing")]
     OutputMissing,
-    #[snafu(display("Release was missing from the version output"))]
+    #[error("Release was missing from the version output")]
     VersionReleaseMissing,
-    #[snafu(display("Commit hash was missing from the version output"))]
+    #[error("Commit hash was missing from the version output")]
     VersionHashMissing,
-    #[snafu(display("Commit date was missing from the version output"))]
+    #[error("Commit date was missing from the version output")]
     VersionDateMissing,
 }
 
@@ -77,7 +75,7 @@ fn wide_open_permissions() -> Option<std::fs::Permissions> {
     None
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum Engine {
     Python,
     Rust,
@@ -107,14 +105,16 @@ pub struct ExecuteResponse {
 
 impl Sandbox {
     pub fn new() -> Result<Self> {
-        let scratch = TempDir::new("playground").context(UnableToCreateTempDir)?;
+        let scratch =
+            TempDir::new("playground").map_err(|e| Error::UnableToCreateTempDir { source: e })?;
         let input_file = scratch.path().join("input");
         let output_dir = scratch.path().join("output");
 
-        fs::create_dir(&output_dir).context(UnableToCreateOutputDir)?;
+        fs::create_dir(&output_dir).map_err(|e| Error::UnableToCreateOutputDir { source: e })?;
 
         if let Some(perms) = wide_open_permissions() {
-            fs::set_permissions(&output_dir, perms).context(UnableToSetOutputPermissions)?;
+            fs::set_permissions(&output_dir, perms)
+                .map_err(|e| Error::UnableToSetOutputPermissions { source: e })?;
         }
 
         Ok(Sandbox {
@@ -125,10 +125,12 @@ impl Sandbox {
     }
 
     fn write_source_code(&self, code: &str) -> Result<()> {
-        fs::write(&self.input_file, code).context(UnableToCreateSourceFile)?;
+        fs::write(&self.input_file, code)
+            .map_err(|e| Error::UnableToCreateSourceFile { source: e })?;
 
         if let Some(perms) = wide_open_permissions() {
-            fs::set_permissions(&self.input_file, perms).context(UnableToSetSourcePermissions)?;
+            fs::set_permissions(&self.input_file, perms)
+                .map_err(|e| Error::UnableToSetSourcePermissions { source: e })?;
         }
 
         log::debug!(
@@ -172,7 +174,7 @@ impl Sandbox {
         match req.engine {
             Engine::Python => {
                 mount_input_file.push("src/main.py");
-            },
+            }
             Engine::Rust => {
                 mount_input_file.push("src/main.rs");
             }
@@ -200,12 +202,12 @@ fn build_execution_command(req: &ExecuteRequest) -> Vec<&'static str> {
         Engine::Python => {
             cmd.push("python3");
             cmd.push("/playground/src/main.py")
-        },
+        }
         Engine::Rust => {
             cmd.push("cargo");
             cmd.push("run");
             // cmd.push("--release")
-        },
+        }
     }
 
     cmd
@@ -255,7 +257,10 @@ async fn run_command_with_timeout(mut command: Command) -> Result<std::process::
     // use std::os::unix::process::ExitStatusExt;
     let timeout = DOCKER_PROCESS_TIMEOUT_HARD;
 
-    let output = command.output().await.context(UnableToStartCompiler)?;
+    let output = command
+        .output()
+        .await
+        .map_err(|e| Error::UnableToStartCompiler { source: e })?;
 
     // Exit early, in case we don't have the container
     if !output.status.success() {
@@ -263,7 +268,11 @@ async fn run_command_with_timeout(mut command: Command) -> Result<std::process::
     }
 
     let output = String::from_utf8_lossy(&output.stdout);
-    let id = output.lines().next().context(MissingCompilerId)?.trim();
+    let id = output
+        .lines()
+        .next()
+        .ok_or(Error::MissingCompilerId)?
+        .trim();
 
     // ----------
 
@@ -300,8 +309,8 @@ async fn run_command_with_timeout(mut command: Command) -> Result<std::process::
                 Ok(ExitStatusExt::from_raw(code))
             }
         }
-        Ok(e) => return e.context(UnableToWaitForCompiler), // Failed to run
-        Err(e) => Err(e),                                   // Timed out
+        Ok(e) => return e.map_err(|e| Error::UnableToWaitForCompiler { source: e }), // Failed to run
+        Err(e) => Err(e),                                                            // Timed out
     };
 
     // ----------
@@ -310,7 +319,7 @@ async fn run_command_with_timeout(mut command: Command) -> Result<std::process::
     let mut output = command
         .output()
         .await
-        .context(UnableToGetOutputFromCompiler)?;
+        .map_err(|e| Error::UnableToGetOutputFromCompiler { source: e })?;
 
     // ----------
 
@@ -319,9 +328,12 @@ async fn run_command_with_timeout(mut command: Command) -> Result<std::process::
         "--force", id
     );
     command.stdout(std::process::Stdio::null());
-    command.status().await.context(UnableToRemoveCompiler)?;
+    command
+        .status()
+        .await
+        .map_err(|e| Error::UnableToRemoveCompiler { source: e })?;
 
-    let code = timed_out.context(CompilerExecutionTimedOut { timeout })?;
+    let code = timed_out.map_err(|e| Error::CompilerExecutionTimedOut { source: e, timeout })?;
 
     output.status = code;
 
@@ -329,7 +341,7 @@ async fn run_command_with_timeout(mut command: Command) -> Result<std::process::
 }
 
 fn vec_to_str(v: Vec<u8>) -> Result<String> {
-    String::from_utf8(v).context(OutputNotUtf8)
+    String::from_utf8(v).map_err(|e| Error::OutputNotUtf8 { source: e })
 }
 
 fn set_execution_environment(cmd: &mut Command) {
@@ -372,12 +384,39 @@ mod test {
     }
 
     #[tokio::test]
-    async fn basic_functionality() {
+    async fn basic_functionality_rust() {
         let _singleton = one_test_at_a_time();
         let req = ExecuteRequest::default();
 
         let sb = Sandbox::new().expect("Unable to create sandbox");
         let resp = sb.execute(&req).await.expect("Unable to execute code");
         assert!(resp.stdout.contains("Hello, world!"));
+    }
+
+    #[tokio::test]
+    async fn basic_functionality_python() {
+        let _singleton = one_test_at_a_time();
+        let req = ExecuteRequest {
+            code: "print('hello world')".to_string(),
+            engine: Engine::Python,
+        };
+
+        let sb = Sandbox::new().expect("Unable to create sandbox");
+        let resp = sb.execute(&req).await.expect("Unable to execute code");
+        assert!(resp.stdout.contains("hello world"));
+    }
+
+    #[tokio::test]
+    async fn test_timeout_rust() {
+        let _singleton = one_test_at_a_time();
+        let req = ExecuteRequest {
+            code: "fn main() { loop {} }".to_string(),
+            engine: Engine::Rust,
+        };
+
+        let sb = Sandbox::new().expect("Unable to create sandbox");
+        let resp = sb.execute(&req).await.expect("Unable to execute code");
+        // Check we got a timeout message
+        assert!(resp.stderr.contains("Killed"));
     }
 }
