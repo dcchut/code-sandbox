@@ -102,6 +102,9 @@ pub struct SandboxBuilder {
     /// The name of the docker image that will be used for this sandbox
     image: String,
 
+    /// The entry point to call
+    entry_point: Vec<&'static str>,
+
     /// Temporary directory where all the good stuff is happening
     scratch: TempDir,
 
@@ -123,7 +126,7 @@ pub struct Sandbox {
 
 impl SandboxBuilder {
     /// Creates a new empty sandbox
-    pub fn new<S: AsRef<str>>(image: S) -> Result<Self> {
+    pub fn new<S: AsRef<str>>(image: S, entry_point: Vec<&'static str>) -> Result<Self> {
         let scratch =
             TempDir::new("playground").map_err(|e| Error::UnableToCreateTempDir { source: e })?;
 
@@ -133,6 +136,7 @@ impl SandboxBuilder {
 
         Ok(Self {
             image: String::from(image.as_ref()),
+            entry_point,
             scratch,
             inputs,
             mounts: Vec::new(),
@@ -169,7 +173,7 @@ impl SandboxBuilder {
 
     /// Finalizes the container, constructing a `CompleteSandbox` which can then be executed.
     /// After this point there is no way to mount additional files
-    pub fn build(self, entry_point: Vec<&'static str>) -> Result<Sandbox> {
+    pub fn build(self) -> Result<Sandbox> {
         // Mount all of our requests
         let mounts = self
             .mounts
@@ -182,7 +186,7 @@ impl SandboxBuilder {
             scratch: self.scratch,
             inputs: self.inputs,
             mounts,
-            entry_point,
+            entry_point: self.entry_point,
         })
     }
 }
@@ -436,28 +440,28 @@ mod test {
     "#;
 
     async fn run_rust_sandbox<S: AsRef<str>>(code: S) -> CompletedSandbox {
-        let mut builder = SandboxBuilder::new("dcchut/code-sandbox-rust-stable")
-            .expect("failed to build sandbox");
+        let mut builder =
+            SandboxBuilder::new("dcchut/code-sandbox-rust-stable", vec!["cargo", "run"])
+                .expect("failed to build sandbox");
         builder
             .mount("/playground/src/main.rs", code.as_ref().to_string())
             .expect("failed to mount code");
 
-        let sb = builder
-            .build(vec!["cargo", "run"])
-            .expect("failed to build sandbox");
+        let sb = builder.build().expect("failed to build sandbox");
         sb.execute().await.expect("failed to run sandbox")
     }
 
     async fn run_python_sandbox<S: AsRef<str>>(code: S) -> CompletedSandbox {
-        let mut builder =
-            SandboxBuilder::new("dcchut/code-sandbox-python").expect("failed to build sandbox");
+        let mut builder = SandboxBuilder::new(
+            "dcchut/code-sandbox-python",
+            vec!["python3", "/playground/src/main.py"],
+        )
+        .expect("failed to build sandbox");
         builder
             .mount("/playground/src/main.py", code.as_ref().to_string())
             .expect("failed to mount code");
 
-        let sb = builder
-            .build(vec!["python3", "/playground/src/main.py"])
-            .expect("failed to build sandbox");
+        let sb = builder.build().expect("failed to build sandbox");
         sb.execute().await.expect("failed to run sandbox")
     }
 
@@ -490,8 +494,9 @@ mod test {
     /// Tests the full end-to-end process, including file mounting, execution, and solution retrieval.,
     #[tokio::test]
     async fn test_sandbox_end_to_end() {
-        let mut builder = SandboxBuilder::new("dcchut/code-sandbox-rust-stable")
-            .expect("failed to create builder");
+        let mut builder =
+            SandboxBuilder::new("dcchut/code-sandbox-rust-stable", vec!["cargo", "run"])
+                .expect("failed to create builder");
 
         builder
             .mount(
@@ -533,9 +538,7 @@ mod test {
             .mount("/playground/output.txt", String::new())
             .expect("failed to mount output");
 
-        let sandbox = builder
-            .build(vec!["cargo", "run", "--release"])
-            .expect("failed to build sandbox");
+        let sandbox = builder.build().expect("failed to build sandbox");
 
         let result = sandbox.execute().await.expect("failed to execute sandbox");
 
