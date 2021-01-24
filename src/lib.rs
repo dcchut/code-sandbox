@@ -248,6 +248,21 @@ impl CompletedSandbox {
         }
     }
 
+    /// Returns the contents of `stdout` from within the sandbox.
+    pub fn stdout(&self) -> &str {
+        self.stdout.as_str()
+    }
+
+    /// Return the contents of `stderr` from within the sandbox.
+    pub fn stderr(&self) -> &str {
+        self.stderr.as_str()
+    }
+
+    /// Return the exit status of the sandbox.
+    pub fn status(&self) -> ExitStatus {
+        self.status
+    }
+
     /// Returns the contents of a mounted file.
     ///
     /// # Panics
