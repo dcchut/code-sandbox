@@ -32,25 +32,11 @@ FROM toolchain as bare-sources
 RUN cargo init /playground
 
 ADD --chown=playground Cargo.toml /playground/Cargo.toml
-ADD --chown=playground crate-information.json /playground/crate-information.json
 RUN cargo fetch
-
-# Build our tool for modifying Cargo.toml at runtime
-
-FROM bare-sources as munge
-
-ADD --chown=playground modify-cargo-toml /playground/modify-cargo-toml
-RUN cargo build --release --manifest-path=/playground/modify-cargo-toml/Cargo.toml
 
 # Compiler and sources
 
 FROM bare-sources as sources
-
-COPY --from=munge /playground/modify-cargo-toml/target/release/modify-cargo-toml /playground/.cargo/bin
-
-# Compiler and pre-compiled crates
-
-FROM sources
 
 ARG channel
 

@@ -1,3 +1,5 @@
+use std::io::Read;
+use std::process::ExitStatus;
 use std::{fs, io, path::PathBuf, string, time::Duration};
 use tempdir::TempDir;
 use thiserror::Error;
@@ -47,170 +49,222 @@ pub enum Error {
     VersionHashMissing,
     #[error("Commit date was missing from the version output")]
     VersionDateMissing,
+    #[error("Container path has no extension")]
+    ContainerPathExtensionMissing,
 }
 
 pub type Result<T, E = Error> = ::std::result::Result<T, E>;
 
-pub struct Sandbox {
-    #[allow(dead_code)]
+/// Represents some content that will be available inside the container.
+#[derive(Debug)]
+struct MountRequest {
+    id: MountId,
+    local_path: PathBuf,
+    container_path: PathBuf,
+    contents: String,
+}
+
+impl MountRequest {
+    /// Performs the requested mount, storing `contents` in local path.
+    fn mount(self) -> Result<Mount> {
+        fs::write(&self.local_path, self.contents)
+            .map_err(|e| Error::UnableToCreateSourceFile { source: e })?;
+
+        Ok(Mount {
+            id: self.id,
+            local_path: self.local_path,
+            container_path: self.container_path,
+        })
+    }
+}
+
+#[derive(Copy, Clone, Debug)]
+pub struct MountId(usize);
+
+#[derive(Debug)]
+struct Mount {
+    id: MountId,
+    local_path: PathBuf,
+    container_path: PathBuf,
+}
+
+impl Mount {
+    fn to_command(&self) -> String {
+        format!(
+            "{}:{}",
+            self.local_path.display(),
+            self.container_path.display()
+        )
+    }
+}
+
+pub struct SandboxBuilder {
+    /// The name of the docker image that will be used for this sandbox
+    image: String,
+
+    /// Temporary directory where all the good stuff is happening
     scratch: TempDir,
-    input_file: PathBuf,
-    output_dir: PathBuf,
+
+    /// Folder which we contain any inputs that need to be mounted
+    inputs: PathBuf,
+
+    /// Keep track of the files we wish to mount
+    mounts: Vec<MountRequest>,
 }
 
-// We must create a world-writable files (rustfmt) and directories
-// (LLVM IR) so that the process inside the Docker container can write
-// into it.
-//
-// This problem does *not* occur when using the indirection of
-// docker-machine.
-fn wide_open_permissions() -> Option<std::fs::Permissions> {
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        Some(PermissionsExt::from_mode(0o777))
+#[derive(Debug)]
+pub struct Sandbox {
+    image: String,
+    scratch: TempDir,
+    inputs: PathBuf,
+    mounts: Vec<Mount>,
+    entry_point: Vec<&'static str>,
+}
+
+impl SandboxBuilder {
+    /// Creates a new empty sandbox
+    pub fn new<S: AsRef<str>>(image: S) -> Result<Self> {
+        let scratch =
+            TempDir::new("playground").map_err(|e| Error::UnableToCreateTempDir { source: e })?;
+
+        // Make a subdirectory to keep our mounts in.
+        let inputs = scratch.path().join("inputs");
+        fs::create_dir(&inputs).map_err(|e| Error::UnableToCreateTempDir { source: e })?;
+
+        Ok(Self {
+            image: String::from(image.as_ref()),
+            scratch,
+            inputs,
+            mounts: Vec::new(),
+        })
     }
 
-    #[cfg(not(target_os = "linux"))]
-    None
-}
+    /// Records a file that will be mounted in the container at a given path. The container
+    /// path *must* have an extension.
+    pub fn mount<P: Into<PathBuf>>(
+        &mut self,
+        container_path: P,
+        contents: String,
+    ) -> Result<MountId> {
+        let container_path = container_path.into();
 
-#[derive(Debug, Clone)]
-pub enum Engine {
-    Python,
-    Rust,
-}
+        let ext = container_path
+            .extension()
+            .ok_or(Error::ContainerPathExtensionMissing)?;
+        let local_path =
+            self.inputs
+                .join(format!("{}.{}", self.mounts.len(), ext.to_string_lossy()));
 
-impl Engine {
-    fn docker_image(&self) -> &'static str {
-        match self {
-            Engine::Python => "code-sandbox-python",
-            Engine::Rust => "code-sandbox-rust-stable",
-        }
+        let id = MountId(self.mounts.len());
+
+        self.mounts.push(MountRequest {
+            id,
+            local_path,
+            container_path,
+            contents,
+        });
+
+        Ok(id)
     }
-}
 
-#[derive(Debug, Clone)]
-pub struct ExecuteRequest {
-    pub code: String,
-    pub engine: Engine,
-}
+    /// Finalizes the container, constructing a `CompleteSandbox` which can then be executed.
+    /// After this point there is no way to mount additional files
+    pub fn build(self, entry_point: Vec<&'static str>) -> Result<Sandbox> {
+        // Mount all of our requests
+        let mounts = self
+            .mounts
+            .into_iter()
+            .map(|request| request.mount())
+            .collect::<Result<Vec<_>>>()?;
 
-#[derive(Debug, Clone)]
-pub struct ExecuteResponse {
-    pub success: bool,
-    pub stdout: String,
-    pub stderr: String,
+        Ok(Sandbox {
+            image: self.image,
+            scratch: self.scratch,
+            inputs: self.inputs,
+            mounts,
+            entry_point,
+        })
+    }
 }
 
 impl Sandbox {
-    pub fn new() -> Result<Self> {
-        let scratch =
-            TempDir::new("playground").map_err(|e| Error::UnableToCreateTempDir { source: e })?;
-        let input_file = scratch.path().join("input");
-        let output_dir = scratch.path().join("output");
+    /// Executes the current sandbox, returning the output from within the sandbox.
+    pub async fn execute(self) -> Result<CompletedSandbox> {
+        let cmd = self.execution_command();
 
-        fs::create_dir(&output_dir).map_err(|e| Error::UnableToCreateOutputDir { source: e })?;
+        let output = run_command_with_timeout(cmd).await?;
 
-        if let Some(perms) = wide_open_permissions() {
-            fs::set_permissions(&output_dir, perms)
-                .map_err(|e| Error::UnableToSetOutputPermissions { source: e })?;
-        }
-
-        Ok(Sandbox {
-            scratch,
-            input_file,
-            output_dir,
-        })
+        Ok(CompletedSandbox::new(self.mounts, self.scratch, output))
     }
 
-    fn write_source_code(&self, code: &str) -> Result<()> {
-        fs::write(&self.input_file, code)
-            .map_err(|e| Error::UnableToCreateSourceFile { source: e })?;
+    /// Build a command to execute our entry point.
+    fn execution_command(&self) -> Command {
+        let mut cmd = self.docker_command();
 
-        if let Some(perms) = wide_open_permissions() {
-            fs::set_permissions(&self.input_file, perms)
-                .map_err(|e| Error::UnableToSetSourcePermissions { source: e })?;
-        }
-
-        log::debug!(
-            "Wrote {} bytes of source to {}",
-            code.len(),
-            self.input_file.display()
-        );
-        Ok(())
-    }
-
-    pub async fn execute(&self, req: &ExecuteRequest) -> Result<ExecuteResponse> {
-        self.write_source_code(&req.code)?;
-        let command = self.execute_command(req);
-
-        let output = run_command_with_timeout(command).await?;
-
-        Ok(ExecuteResponse {
-            success: output.status.success(),
-            stdout: vec_to_str(output.stdout)?,
-            stderr: vec_to_str(output.stderr)?,
-        })
-    }
-
-    fn execute_command(&self, req: &ExecuteRequest) -> Command {
-        let mut cmd = self.docker_command(req);
-        set_execution_environment(&mut cmd);
-        let execution_cmd = build_execution_command(req);
-
-        cmd.arg(req.engine.docker_image()).args(&execution_cmd);
+        // Last argument to docker should be the image name,
+        // which we then follow up with the internal entry point.
+        cmd.arg(&self.image).args(&self.entry_point);
 
         log::debug!("Execution command is {:?}", cmd);
 
         cmd
     }
 
-    fn docker_command(&self, req: &ExecuteRequest) -> Command {
-        let mut mount_input_file = self.input_file.as_os_str().to_os_string();
-        mount_input_file.push(":");
-        mount_input_file.push("/playground/");
-
-        match req.engine {
-            Engine::Python => {
-                mount_input_file.push("src/main.py");
-            }
-            Engine::Rust => {
-                mount_input_file.push("src/main.rs");
-            }
-        }
-
-        let mut mount_output_dir = self.output_dir.as_os_str().to_os_string();
-        mount_output_dir.push(":");
-        mount_output_dir.push("/playground-result");
-
+    /// Builds a basic command for invoking docker
+    fn docker_command(&self) -> Command {
         let mut cmd = basic_secure_docker_command();
 
-        cmd.arg("--volume")
-            .arg(&mount_input_file)
-            .arg("--volume")
-            .arg(&mount_output_dir);
+        for mount in &self.mounts {
+            cmd.arg("--volume");
+            cmd.arg(mount.to_command());
+        }
 
         cmd
     }
 }
 
-fn build_execution_command(req: &ExecuteRequest) -> Vec<&'static str> {
-    let mut cmd = vec![];
+#[derive(Debug)]
+pub struct CompletedSandbox {
+    mounts: Vec<Mount>,
+    scratch: TempDir,
+    stdout: String,
+    stderr: String,
+    status: ExitStatus,
+}
 
-    match req.engine {
-        Engine::Python => {
-            cmd.push("python3");
-            cmd.push("/playground/src/main.py")
-        }
-        Engine::Rust => {
-            cmd.push("cargo");
-            cmd.push("run");
-            cmd.push("--release");
+impl CompletedSandbox {
+    pub(crate) fn new(mounts: Vec<Mount>, scratch: TempDir, output: std::process::Output) -> Self {
+        // Process the output into something usable.
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let status = output.status;
+
+        Self {
+            mounts,
+            scratch,
+            stdout,
+            stderr,
+            status,
         }
     }
 
-    cmd
+    /// Returns the contents of a mounted file.
+    ///
+    /// # Panics
+    /// Will panic is `id` does not correspond to a mount for this sandbox.
+    pub fn get_mount_output(&self, id: MountId) -> Result<String> {
+        let mount = self.mounts.get(id.0).expect("invalid mount id");
+
+        // Load the input file
+        let mut contents = String::new();
+        // TODO: fix this error type up
+        let mut file = std::fs::File::open(&mount.local_path)
+            .map_err(|_| Error::ContainerPathExtensionMissing)?;
+        file.read_to_string(&mut contents)
+            .map_err(|_| Error::ContainerPathExtensionMissing)?;
+
+        Ok(contents)
+    }
 }
 
 macro_rules! docker_command {
@@ -340,14 +394,6 @@ async fn run_command_with_timeout(mut command: Command) -> Result<std::process::
     Ok(output)
 }
 
-fn vec_to_str(v: Vec<u8>) -> Result<String> {
-    String::from_utf8(v).map_err(|e| Error::OutputNotUtf8 { source: e })
-}
-
-fn set_execution_environment(cmd: &mut Command) {
-    cmd.args(&["--env", &format!("PLAYGROUND_EDITION={}", "2018")]);
-}
-
 #[cfg(test)]
 mod test {
     use super::*;
@@ -374,49 +420,135 @@ mod test {
     }
     "#;
 
-    impl Default for ExecuteRequest {
-        fn default() -> Self {
-            ExecuteRequest {
-                code: HELLO_WORLD_CODE.to_string(),
-                engine: Engine::Rust,
-            }
-        }
+    async fn run_rust_sandbox<S: AsRef<str>>(code: S) -> CompletedSandbox {
+        let mut builder = SandboxBuilder::new("dcchut/code-sandbox-rust-stable")
+            .expect("failed to build sandbox");
+        builder
+            .mount("/playground/src/main.rs", code.as_ref().to_string())
+            .expect("failed to mount code");
+
+        let sb = builder
+            .build(vec!["cargo", "run"])
+            .expect("failed to build sandbox");
+        sb.execute().await.expect("failed to run sandbox")
+    }
+
+    async fn run_python_sandbox<S: AsRef<str>>(code: S) -> CompletedSandbox {
+        let mut builder =
+            SandboxBuilder::new("dcchut/code-sandbox-python").expect("failed to build sandbox");
+        builder
+            .mount("/playground/src/main.py", code.as_ref().to_string())
+            .expect("failed to mount code");
+
+        let sb = builder
+            .build(vec!["python3", "/playground/src/main.py"])
+            .expect("failed to build sandbox");
+        sb.execute().await.expect("failed to run sandbox")
     }
 
     #[tokio::test]
     async fn basic_functionality_rust() {
         let _singleton = one_test_at_a_time();
-        let req = ExecuteRequest::default();
+        let response = run_rust_sandbox(HELLO_WORLD_CODE).await;
 
-        let sb = Sandbox::new().expect("Unable to create sandbox");
-        let resp = sb.execute(&req).await.expect("Unable to execute code");
-        assert!(resp.stdout.contains("Hello, world!"));
+        assert!(response.stdout.contains("Hello, world!"));
     }
 
     #[tokio::test]
     async fn basic_functionality_python() {
         let _singleton = one_test_at_a_time();
-        let req = ExecuteRequest {
-            code: "print('hello world')".to_string(),
-            engine: Engine::Python,
-        };
+        let response = run_python_sandbox("print('hello world')").await;
 
-        let sb = Sandbox::new().expect("Unable to create sandbox");
-        let resp = sb.execute(&req).await.expect("Unable to execute code");
-        assert!(resp.stdout.contains("hello world"));
+        assert!(response.stdout.contains("hello world"));
     }
 
     #[tokio::test]
     async fn test_timeout_rust() {
         let _singleton = one_test_at_a_time();
-        let req = ExecuteRequest {
-            code: "fn main() { loop {} }".to_string(),
-            engine: Engine::Rust,
-        };
+        let response = run_rust_sandbox("fn main() { loop{} }").await;
 
-        let sb = Sandbox::new().expect("Unable to create sandbox");
-        let resp = sb.execute(&req).await.expect("Unable to execute code");
-        // Check we got a timeout message
-        assert!(resp.stderr.contains("Killed"));
+        // should get a failing status code
+        assert!(!response.status.success());
+        assert!(response.stderr.contains("Killed"));
+    }
+
+    /// Tests the full end-to-end process, including file mounting, execution, and solution retrieval.,
+    #[tokio::test]
+    async fn test_sandbox_end_to_end() {
+        let mut builder = SandboxBuilder::new("dcchut/code-sandbox-rust-stable")
+            .expect("failed to create builder");
+
+        builder
+            .mount(
+                "/playground/src/solution.rs",
+                String::from(
+                    r#"
+                pub fn hello_world() {
+                    println!("hello world!");
+                }
+            "#,
+                ),
+            )
+            .expect("failed to mount code");
+
+        builder
+            .mount(
+                "/playground/src/main.rs",
+                String::from(
+                    r#"
+                use std::fs::File;
+                use std::io::prelude::*;
+
+                mod solution;
+
+                fn main() -> std::io::Result<()> {
+                    solution::hello_world();
+
+                    // Write some stuff to /output.txt
+                    let mut file = File::create("output.txt")?;
+                    file.write_all(b"asdasd")?;
+                    Ok(())
+                }
+            "#,
+                ),
+            )
+            .expect("failed to mount entry point");
+
+        let output_mount_id = builder
+            .mount("/playground/output.txt", String::new())
+            .expect("failed to mount output");
+
+        let sandbox = builder
+            .build(vec!["cargo", "run", "--release"])
+            .expect("failed to build sandbox");
+
+        let result = sandbox.execute().await.expect("failed to execute sandbox");
+
+        // Process should have successfully completed.
+        assert!(result.status.success());
+
+        // Get the output from our outputs mount
+        let outputs = result
+            .get_mount_output(output_mount_id)
+            .expect("failed to get mount output");
+
+        assert_eq!(outputs, "asdasd");
+    }
+
+    /// Tests that the rust container has serde support.
+    #[tokio::test]
+    async fn test_serde_support() {
+        let response = run_rust_sandbox(
+            r#"
+use serde_json::{Result, Value};
+
+fn main() {
+    println!("success");
+}"#,
+        )
+        .await;
+
+        assert!(response.status.success());
+        assert!(response.stdout.contains("success"));
     }
 }
