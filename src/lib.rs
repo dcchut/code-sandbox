@@ -113,6 +113,12 @@ pub struct SandboxBuilder {
 
     /// Keep track of the files we wish to mount
     mounts: Vec<MountRequest>,
+
+    /// The length of the soft timeout
+    soft_timeout: Option<Duration>,
+
+    /// The length of the hard timeout
+    hard_timeout: Option<Duration>,
 }
 
 #[derive(Debug)]
@@ -122,6 +128,8 @@ pub struct Sandbox {
     inputs: PathBuf,
     mounts: Vec<Mount>,
     entry_point: Vec<&'static str>,
+    soft_timeout: Duration,
+    hard_timeout: Duration,
 }
 
 impl SandboxBuilder {
@@ -140,7 +148,20 @@ impl SandboxBuilder {
             scratch,
             inputs,
             mounts: Vec::new(),
+            soft_timeout: None,
+            hard_timeout: None,
         })
+    }
+
+    /// Sets the soft and hard timeout for this container.
+    ///
+    /// # Panics
+    /// This will panic if the soft timeout is longer than the hard timeout.
+    pub fn with_timeout(&mut self, soft_timeout: Duration, hard_timeout: Duration) {
+        assert!(soft_timeout <= hard_timeout);
+
+        self.soft_timeout = Some(soft_timeout);
+        self.hard_timeout = Some(hard_timeout);
     }
 
     /// Records a file that will be mounted in the container at a given path. The container
@@ -187,6 +208,8 @@ impl SandboxBuilder {
             inputs: self.inputs,
             mounts,
             entry_point: self.entry_point,
+            soft_timeout: self.soft_timeout.unwrap_or(DOCKER_PROCESS_TIMEOUT_SOFT),
+            hard_timeout: self.hard_timeout.unwrap_or(DOCKER_PROCESS_TIMEOUT_HARD),
         })
     }
 }
@@ -196,7 +219,7 @@ impl Sandbox {
     pub async fn execute(self) -> Result<CompletedSandbox> {
         let cmd = self.execution_command();
 
-        let output = run_command_with_timeout(cmd).await?;
+        let output = run_command_with_timeout(cmd, self.hard_timeout).await?;
 
         Ok(CompletedSandbox::new(self.mounts, self.scratch, output))
     }
@@ -216,7 +239,7 @@ impl Sandbox {
 
     /// Builds a basic command for invoking docker
     fn docker_command(&self) -> Command {
-        let mut cmd = basic_secure_docker_command();
+        let mut cmd = basic_secure_docker_command(self.soft_timeout);
 
         for mount in &self.mounts {
             cmd.arg("--volume");
@@ -294,7 +317,7 @@ macro_rules! docker_command {
     });
 }
 
-fn basic_secure_docker_command() -> Command {
+fn basic_secure_docker_command(soft_timeout: Duration) -> Command {
     let mut cmd = docker_command!(
         "run",
         "--detach",
@@ -307,13 +330,13 @@ fn basic_secure_docker_command() -> Command {
         "--net",
         "none",
         "--memory",
-        "256m",
+        "512m",
         "--memory-swap",
-        "256m",
+        "512m",
         "--env",
         format!(
             "PLAYGROUND_TIMEOUT={}",
-            DOCKER_PROCESS_TIMEOUT_SOFT.as_secs()
+            soft_timeout.as_secs()
         ),
     );
 
@@ -326,10 +349,7 @@ fn basic_secure_docker_command() -> Command {
     cmd
 }
 
-async fn run_command_with_timeout(mut command: Command) -> Result<std::process::Output> {
-    // use std::os::unix::process::ExitStatusExt;
-    let timeout = DOCKER_PROCESS_TIMEOUT_HARD;
-
+async fn run_command_with_timeout(mut command: Command, hard_timeout: Duration) -> Result<std::process::Output> {
     let output = command
         .output()
         .await
@@ -351,7 +371,7 @@ async fn run_command_with_timeout(mut command: Command) -> Result<std::process::
 
     let mut command = docker_command!("wait", id);
 
-    let timed_out = match tokio::time::timeout(timeout, command.output()).await {
+    let timed_out = match tokio::time::timeout(hard_timeout, command.output()).await {
         Ok(Ok(o)) => {
             // Didn't time out, didn't fail to run
             let o = String::from_utf8_lossy(&o.stdout);
@@ -406,7 +426,7 @@ async fn run_command_with_timeout(mut command: Command) -> Result<std::process::
         .await
         .map_err(|e| Error::UnableToRemoveCompiler { source: e })?;
 
-    let code = timed_out.map_err(|e| Error::CompilerExecutionTimedOut { source: e, timeout })?;
+    let code = timed_out.map_err(|e| Error::CompilerExecutionTimedOut { source: e, timeout: hard_timeout })?;
 
     output.status = code;
 
@@ -598,4 +618,24 @@ fn main() {
         assert!(response.status.success());
         assert!(response.stdout.contains("success"));
     }
+
+    #[tokio::test]
+    async fn basic_functionality_hassssskell() {
+        let _singleton = one_test_at_a_time();
+        let response = run_haskell_sandbox(r#"
+        module Main where
+
+        main :: IO ()
+        main = do
+            print "hello world!"
+
+        "#).await;
+
+        dbg!(&response);
+
+        // Note that haskell outputs the quotes around our string
+        assert!(response.stdout.contains(r#""hello world!""#));
+    }
+
+
 }

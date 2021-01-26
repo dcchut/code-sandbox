@@ -18,6 +18,7 @@ extra-source-files:  CHANGELOG.md
 
 executable dccode
   main-is:             Main.hs
+  ghc-options: -Wno-missing-home-modules
   --other-modules:
   -- other-extensions:
   build-depends:
