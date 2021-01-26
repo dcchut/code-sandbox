@@ -465,6 +465,19 @@ mod test {
         sb.execute().await.expect("failed to run sandbox")
     }
 
+    async fn run_haskell_sandbox<S: AsRef<str>>(code: S) -> CompletedSandbox {
+        let mut builder = SandboxBuilder::new(
+            "dcchut/code-sandbox-haskell",
+            vec!["cabal", "run", "-v0"]
+        ).expect("falied to build sandbox");
+
+        builder.mount("/playground/Main.hs", code.as_ref().to_string())
+            .expect("failed to mount code");
+
+        let sb = builder.build().expect("failed to build sandbox");
+        sb.execute().await.expect("failed to run sandbox")
+    }
+
     #[tokio::test]
     async fn basic_functionality_rust() {
         let _singleton = one_test_at_a_time();
@@ -479,6 +492,22 @@ mod test {
         let response = run_python_sandbox("print('hello world')").await;
 
         assert!(response.stdout.contains("hello world"));
+    }
+
+    #[tokio::test]
+    async fn basic_functionality_haskell() {
+        let _singleton = one_test_at_a_time();
+        let response = run_haskell_sandbox(r#"
+        module Main where
+
+        main :: IO ()
+        main = do
+            print "hello world!"
+
+        "#).await;
+
+        // Note that haskell outputs the quotes around our string
+        assert!(response.stdout.contains(r#""hello world!""#));
     }
 
     #[tokio::test]
