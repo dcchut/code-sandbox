@@ -4,6 +4,7 @@ use std::{fs, io, path::PathBuf, string, time::Duration};
 use tempdir::TempDir;
 use thiserror::Error;
 use tokio::process::Command;
+use log::debug;
 
 const DOCKER_PROCESS_TIMEOUT_SOFT: Duration = Duration::from_secs(4);
 const DOCKER_PROCESS_TIMEOUT_HARD: Duration = Duration::from_secs(8);
@@ -217,6 +218,7 @@ impl SandboxBuilder {
 impl Sandbox {
     /// Executes the current sandbox, returning the output from within the sandbox.
     pub async fn execute(self) -> Result<CompletedSandbox> {
+        debug!("executing sandbox");
         let cmd = self.execution_command();
 
         let output = run_command_with_timeout(cmd, self.hard_timeout).await?;
@@ -354,6 +356,8 @@ async fn run_command_with_timeout(mut command: Command, hard_timeout: Duration) 
         .output()
         .await
         .map_err(|e| Error::UnableToStartCompiler { source: e })?;
+
+    debug!("{:?}", output);
 
     // Exit early, in case we don't have the container
     if !output.status.success() {
