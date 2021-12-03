@@ -2,8 +2,9 @@ use code_sandbox::SandboxBuilder;
 
 #[tokio::test]
 async fn basic_sandbox_usage() {
-    let mut builder = SandboxBuilder::new("dcchut/code-sandbox-rust-stable", vec!["cargo", "run"])
-        .expect("failed to create builder");
+    let mut builder =
+        SandboxBuilder::new("dcchut/code-sandbox-rust-stable").expect("failed to create builder");
+    builder.entry_point(["cargo", "run"]);
 
     builder
         .mount(
