@@ -26,6 +26,6 @@ RUN cabal build
 
 # Compiler and sources
 FROM bare-sources as sources
-RUN rm /playground/Main.hs
+RUN rm /playground/app/Main.hs
 
 ENTRYPOINT ["/playground/tools/entrypoint.sh"]

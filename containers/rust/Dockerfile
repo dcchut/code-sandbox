@@ -23,7 +23,6 @@ WORKDIR /playground
 ADD --chown=playground https://static.rust-lang.org/rustup/release-stable.toml /playground/tools/rustup-manifest.toml
 ADD --chown=playground https://static.rust-lang.org/dist/channel-rust-${channel}-date.txt /playground/tools/rust-channel-version
 RUN curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal --default-toolchain "${channel}"
-ADD --chown=playground entrypoint.sh /playground/tools/
 
 # Fetch all the crate source files
 
@@ -43,5 +42,6 @@ ARG channel
 RUN cargo build
 RUN cargo build --release
 RUN rm src/*.rs
+ADD --chown=playground entrypoint.sh /playground/tools/
 
 ENTRYPOINT ["/playground/tools/entrypoint.sh"]

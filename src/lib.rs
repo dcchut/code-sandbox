@@ -1,10 +1,146 @@
+//! # code-sandbox
+//!
+//! A proof-of-concept library for creating temporary Docker containers for the purposes of running code.
+//! Some example use cases:
+//! - A backend component of a code editor or submission system, or
+//! - To allow users of a Discord bot to run code.
+//!
+//! ## Docker images
+//!
+//! This repository contains a few Dockerfiles that are intended for use in a code sandbox.
+//! The provided images are:
+//!
+//! | Image                             | Environment description |
+//! |-----------------------------------|-------------------------|
+//! | `dcchut/code-sandbox-rust-stable` | Latest stable Rust      |
+//! | `dcchut/code-sandbox-python`      | Python 3.7              |
+//! | `dcchut/code-sandbox-haskell`     | GHC 8.10.7              |
+//!
+//! ### Soft timeout wrapper
+//! Each image has a basic wrapper script responsible for enforcing a soft timeout:
+//!
+//! ```shell
+//! #!/bin/bash
+//!
+//! set -eu
+//!
+//! timeout=${PLAYGROUND_TIMEOUT:-10}
+//!
+//! # Don't use `exec` here. The shell is what prints out the useful
+//! # "Killed" message
+//! timeout --signal=KILL ${timeout} "$@"
+//! ```
+//!
+//! A hard timeout is enforced at the library level when the sandbox is being ran.
+//!
+//! ### Creating a new image
+//!
+//! Creating a new sandbox image is fairly straightforward: prepare a Dockerfile
+//! with the desired environment whose entry point is the wrapper script (seen above).
+//! Please feel free to put up a PR if you have a code sandbox to contribute or an
+//! update or fix to an existing sandbox!
+//!
+//! *Tip*: Make sure to make use of the Docker cache to reduce compilation time
+//! inside the image!  For an example of this see the `dcchut/code-sandbox-rust` Dockerfile -
+//! build requirements are pre-compiled so that the image only has to pay the compilation
+//! cost of the code the user actually writes.
+//!
+//! ## `code-sandbox` crate
+//!
+//! This library is geared towards running short-lived Docker containers
+//! for the purposes of running code - it is not a general purpose library
+//! for interacting with Docker.
+//!
+//! ### Running your first sandbox
+//! The following example shows mounting the `dcchut/code-sandbox-python` image
+//! and running some Python code in it:
+//!
+//! ```rust
+//! use code_sandbox::{Result, SandboxBuilder};
+//!
+//! // Bog-standard iterative fibonacci implementation
+//! const FIBONACCI: &'static str = r#"
+//! def fib(n: int) -> int:
+//!     """
+//!     Defined by the relations:
+//!
+//!     fib(n) = 1 if n <= 1
+//!     fib(n+2) = fib(n+1) + fib(n) for n >= 0
+//!     """
+//!     p1, p2 = 1, 1
+//!     for _ in range(n-1):
+//!         p1, p2 = p1 + p2, p1
+//!     return p1
+//!
+//! print(fib(6))
+//! "#;
+//!
+//! #[tokio::main]
+//! async fn main() -> Result<()> {
+//!     let mut builder = SandboxBuilder::new("dcchut/code-sandbox-python")?;
+//!
+//!     // Request the builder to mount our Fibonacci script when we run the image
+//!     builder.mount("/app/main.py", FIBONACCI)?;
+//!
+//!     // Set the entry point to run inside the image
+//!     builder.entry_point(["python3", "/app/main.py"]);
+//!
+//!     // Build and run the sandbox
+//!     let result = builder.build()?.execute().await?;
+//!     assert_eq!(result.stdout(), "13\n");
+//!
+//!     Ok(())
+//! }
+//! ```
+//!
+//! ### Reading the value of a mounted file.
+//! It is also possible to read the contents of a mounted file after the sandbox
+//! has been ran.
+//!
+//! ```rust
+//! use code_sandbox::{Result, SandboxBuilder};
+//!
+//! // Reads in a file, modifies its contents, then writes the file back out again.
+//! const SANDBOX_CODE: &'static str = r#"
+//! with open("/app/contents.txt", "rt") as fp:
+//!     contents = fp.read()
+//!
+//! contents += "\nModified by the sandbox"
+//!
+//! with open("/app/contents.txt", "wt") as fp:
+//!     fp.write(contents)
+//! "#;
+//!
+//! #[tokio::main]
+//! async fn main() -> Result<()> {
+//!     // As in the previous example
+//!     let mut builder = SandboxBuilder::new("dcchut/code-sandbox-python")?;
+//!     builder.mount("/app/main.py", SANDBOX_CODE)?;
+//!     builder.entry_point(["python3", "/app/main.py"]);
+//!
+//!     // Request to mount a file at /app/contents.txt.  The mount method
+//!     // returns an identifier which will be used to identify this file later.
+//!     let contents_txt = builder.mount("/app/contents.txt", "Raspberry")?;
+//!
+//!     // Build and run the sandbox
+//!     let result = builder.build()?.execute().await?;
+//!
+//!     // Get the contents of the mounted file
+//!     let contents = result.get_mount_output(contents_txt)?;
+//!     assert_eq!(contents, "Raspberry\nModified by the sandbox");
+//!
+//!     Ok(())
+//! }
+//! ```
+//!
+//!
+use log::debug;
 use std::io::Read;
 use std::process::ExitStatus;
 use std::{fs, io, path::PathBuf, string, time::Duration};
 use tempdir::TempDir;
 use thiserror::Error;
 use tokio::process::Command;
-use log::debug;
 
 const DOCKER_PROCESS_TIMEOUT_SOFT: Duration = Duration::from_secs(4);
 const DOCKER_PROCESS_TIMEOUT_HARD: Duration = Duration::from_secs(8);
@@ -59,7 +195,6 @@ pub type Result<T, E = Error> = ::std::result::Result<T, E>;
 /// Represents some content that will be available inside the container.
 #[derive(Debug)]
 struct MountRequest {
-    id: MountId,
     local_path: PathBuf,
     container_path: PathBuf,
     contents: String,
@@ -72,19 +207,46 @@ impl MountRequest {
             .map_err(|e| Error::UnableToCreateSourceFile { source: e })?;
 
         Ok(Mount {
-            id: self.id,
             local_path: self.local_path,
             container_path: self.container_path,
         })
     }
 }
 
+/// Used to identify a file that has been mounted in a container.
+///
+/// # Example
+/// ```rust
+/// use code_sandbox::{Result, SandboxBuilder};
+///
+/// #[tokio::main]
+/// async fn main() -> Result<()> {
+///     // Set up a sandbox which overwrites the contents of /app/mounted.txt
+///     let mut builder = SandboxBuilder::new("dcchut/code-sandbox-python")?;
+///     builder.entry_point(["python3", "/app/main.py"]);
+///     builder.mount(
+///         "/app/main.py",
+///         r#"
+/// with open("/app/mounted.txt", "wt") as fp:
+///     fp.write("Hello World!")
+/// "#,
+///     )?;
+///
+///     // A [`MountId`] is returned when we request a mount.
+///     let mount_id = builder.mount("/app/mounted.txt", "")?;
+///     let result = builder.build()?.execute().await?;
+///
+///     // The [`MountID`] can then be used to obtain the value of the modified file.
+///     assert_eq!(result.get_mount_output(mount_id)?, "Hello World!");
+///
+///     Ok(())
+/// }
+/// ```
 #[derive(Copy, Clone, Debug)]
 pub struct MountId(usize);
 
 #[derive(Debug)]
 struct Mount {
-    id: MountId,
     local_path: PathBuf,
     container_path: PathBuf,
 }
@@ -99,12 +261,13 @@ impl Mount {
     }
 }
 
+/// Builder struct to construct a [`Sandbox`].
 pub struct SandboxBuilder {
     /// The name of the docker image that will be used for this sandbox
     image: String,
 
     /// The entry point to call
-    entry_point: Vec<&'static str>,
+    entry_point: Vec<String>,
 
     /// Temporary directory where all the good stuff is happening
     scratch: TempDir,
@@ -126,16 +289,28 @@ pub struct SandboxBuilder {
 pub struct Sandbox {
     image: String,
     scratch: TempDir,
-    inputs: PathBuf,
+    _inputs: PathBuf,
     mounts: Vec<Mount>,
-    entry_point: Vec<&'static str>,
+    entry_point: Vec<String>,
     soft_timeout: Duration,
     hard_timeout: Duration,
 }
 
 impl SandboxBuilder {
     /// Creates a new empty sandbox
-    pub fn new<S: AsRef<str>>(image: S, entry_point: Vec<&'static str>) -> Result<Self> {
+    ///
+    /// # Example
+    /// ```rust
+    /// use code_sandbox::{Result, SandboxBuilder};
+    ///
+    /// fn main() -> Result<()> {
+    ///     let mut builder = SandboxBuilder::new("dcchut/code-sandbox-python")?;
+    ///     let sandbox = builder.build()?;
+    ///
+    ///     Ok(())
+    /// }
+    /// ```
+    pub fn new<S: AsRef<str>>(image: S) -> Result<Self> {
         let scratch =
             TempDir::new("playground").map_err(|e| Error::UnableToCreateTempDir { source: e })?;
 
@@ -145,7 +320,7 @@ impl SandboxBuilder {
 
         Ok(Self {
             image: String::from(image.as_ref()),
-            entry_point,
+            entry_point: Vec::new(),
             scratch,
             inputs,
             mounts: Vec::new(),
@@ -154,49 +329,116 @@ impl SandboxBuilder {
         })
     }
 
+    /// Set the entry point for this container.
+    ///
+    /// # Example
+    /// ```rust
+    /// use code_sandbox::{Result, SandboxBuilder};
+    ///
+    /// fn main() -> Result<()> {
+    ///     let mut builder = SandboxBuilder::new("dcchut/code-sandbox-python")?;
+    ///     builder.entry_point(["python3.6", "/app/main.py"]);
+    ///
+    ///     Ok(())
+    /// }
+    /// ```
+    pub fn entry_point<I: IntoIterator<Item = R>, R: ToString>(
+        &mut self,
+        entry_point: I,
+    ) -> &mut Self {
+        self.entry_point = entry_point.into_iter().map(|r| r.to_string()).collect();
+        self
+    }
+
     /// Sets the soft and hard timeout for this container.
     ///
     /// # Panics
     /// This will panic if the soft timeout is longer than the hard timeout.
-    pub fn with_timeout(&mut self, soft_timeout: Duration, hard_timeout: Duration) {
+    ///
+    /// # Example
+    /// ```rust
+    /// use code_sandbox::{Result, SandboxBuilder};
+    /// use std::time::Duration;
+    ///
+    /// fn main() -> Result<()> {
+    ///     let mut builder = SandboxBuilder::new("dcchut/code-sandbox-python")?;
+    ///
+    ///     // Soft timeout of 5 seconds, hard timeout of 10 seconds
+    ///     builder.with_timeout(Duration::from_secs(5), Duration::from_secs(10));
+    ///     Ok(())
+    /// }
+    /// ```
+    pub fn with_timeout(&mut self, soft_timeout: Duration, hard_timeout: Duration) -> &mut Self {
         assert!(soft_timeout <= hard_timeout);
 
         self.soft_timeout = Some(soft_timeout);
         self.hard_timeout = Some(hard_timeout);
+
+        self
     }
 
-    /// Records a file that will be mounted in the container at a given path. The container
-    /// path *must* have an extension.
-    pub fn mount<P: Into<PathBuf>>(
+    /// Mounts `contents` at the given path within the container.
+    ///
+    /// # Example
+    /// ```rust
+    /// use code_sandbox::{Result, SandboxBuilder};
+    ///
+    /// #[tokio::main]
+    /// async fn main() -> Result<()> {
+    ///     let mut builder = SandboxBuilder::new("alpine:3.15")?;
+    ///     builder.entry_point(["/bin/sh", "-c", "echo 'final contents' > /app/mounted.txt"]);
+    ///
+    ///     let id = builder.mount("/app/mounted.txt", "initial contents")?;
+    ///
+    ///     // Mounted file was changed inside the sandbox
+    ///     let result = builder.build()?.execute().await?;
+    ///     assert_eq!(result.get_mount_output(id)?, "final contents\n");
+    ///
+    ///     Ok(())
+    /// }
+    /// ```
+    pub fn mount<S: ToString, P: Into<PathBuf>>(
         &mut self,
         container_path: P,
-        contents: String,
+        contents: S,
     ) -> Result<MountId> {
         let container_path = container_path.into();
 
-        let ext = container_path
-            .extension()
-            .ok_or(Error::ContainerPathExtensionMissing)?;
-        let local_path =
-            self.inputs
-                .join(format!("{}.{}", self.mounts.len(), ext.to_string_lossy()));
+        let local_path = self.inputs.join(format!("{}.txt", self.mounts.len()));
 
         let id = MountId(self.mounts.len());
 
         self.mounts.push(MountRequest {
-            id,
             local_path,
             container_path,
-            contents,
+            contents: contents.to_string(),
         });
 
         Ok(id)
     }
 
-    /// Finalizes the container, constructing a `CompleteSandbox` which can then be executed.
-    /// After this point there is no way to mount additional files
+    /// Finalizes the container, constructing a [`Sandbox`] which can be executed.  After this
+    /// point there is no way to mount additional files or change any configuration options.
+    ///
+    /// # Example
+    /// ```rust
+    /// use code_sandbox::{Result, SandboxBuilder};
+    ///
+    /// #[tokio::main]
+    /// async fn main() -> Result<()> {
+    ///     let mut builder = SandboxBuilder::new("dcchut/code-sandbox-python")?;
+    ///     builder.entry_point(["python3", "--version"]);
+    ///
+    ///     // Build the sandbox, ready for execution.
+    ///     let sandbox = builder.build()?;
+    ///
+    ///     let result = sandbox.execute().await?;
+    ///     assert_eq!(result.stdout().contains("Python 3."), true);
+    ///
+    ///     Ok(())
+    /// }
+    /// ```
     pub fn build(self) -> Result<Sandbox> {
-        // Mount all of our requests
         let mounts = self
             .mounts
             .into_iter()
@@ -206,7 +448,7 @@ impl SandboxBuilder {
         Ok(Sandbox {
             image: self.image,
             scratch: self.scratch,
-            inputs: self.inputs,
+            _inputs: self.inputs,
             mounts,
             entry_point: self.entry_point,
             soft_timeout: self.soft_timeout.unwrap_or(DOCKER_PROCESS_TIMEOUT_SOFT),
@@ -217,6 +459,20 @@ impl SandboxBuilder {
 
 impl Sandbox {
     /// Executes the current sandbox, returning the output from within the sandbox.
+    ///
+    /// # Example
+    /// ```rust
+    /// use code_sandbox::{Result, SandboxBuilder};
+    ///
+    /// #[tokio::main]
+    /// async fn main() -> Result<()> {
+    ///     let mut builder = SandboxBuilder::new("dcchut/code-sandbox-rust-stable")?;
+    ///     builder.entry_point(["cargo", "--version"]);
+    ///
+    ///     let result = builder.build()?.execute().await?;
+    ///     Ok(())
+    /// }
+    /// ```
     pub async fn execute(self) -> Result<CompletedSandbox> {
         debug!("executing sandbox");
         let cmd = self.execution_command();
@@ -255,10 +511,10 @@ impl Sandbox {
 #[derive(Debug)]
 pub struct CompletedSandbox {
     mounts: Vec<Mount>,
-    scratch: TempDir,
     stdout: String,
     stderr: String,
     status: ExitStatus,
+    _scratch: TempDir,
 }
 
 impl CompletedSandbox {
@@ -270,7 +526,7 @@ impl CompletedSandbox {
 
         Self {
             mounts,
-            scratch,
+            _scratch: scratch,
             stdout,
             stderr,
             status,
@@ -278,16 +534,82 @@ impl CompletedSandbox {
     }
 
     /// Returns the contents of `stdout` from within the sandbox.
+    ///
+    /// # Example
+    /// ```rust
+    /// use code_sandbox::{Result, SandboxBuilder};
+    ///
+    /// const PYTHON_CODE: &'static str = r#"
+    /// print("this ends up on stdout")
+    /// "#;
+    ///
+    /// #[tokio::main]
+    /// async fn main() -> Result<()> {
+    ///     let mut builder = SandboxBuilder::new("dcchut/code-sandbox-python")?;
+    ///     builder.entry_point(["python3", "/app/main.py"]);
+    ///     builder.mount("/app/main.py", PYTHON_CODE)?;
+    ///
+    ///     let result = builder.build()?.execute().await?;
+    ///     assert_eq!(result.stdout(), "this ends up on stdout\n");
+    ///
+    ///     Ok(())
+    /// }
+    /// ```
     pub fn stdout(&self) -> &str {
         self.stdout.as_str()
     }
 
     /// Return the contents of `stderr` from within the sandbox.
+    ///
+    /// # Example
+    /// ```rust
+    /// use code_sandbox::{Result, SandboxBuilder};
+    ///
+    /// const PYTHON_CODE: &'static str = r#"
+    /// import sys
+    ///
+    /// print("this ends up on stderr", file=sys.stderr)
+    /// "#;
+    ///
+    /// #[tokio::main]
+    /// async fn main() -> Result<()> {
+    ///     let mut builder = SandboxBuilder::new("dcchut/code-sandbox-python")?;
+    ///     builder.entry_point(["python3", "/app/main.py"]);
+    ///     builder.mount("/app/main.py", PYTHON_CODE)?;
+    ///
+    ///     let result = builder.build()?.execute().await?;
+    ///     assert_eq!(result.stderr(), "this ends up on stderr\n");
+    ///
+    ///     Ok(())
+    /// }
+    /// ```
     pub fn stderr(&self) -> &str {
         self.stderr.as_str()
     }
 
     /// Return the exit status of the sandbox.
+    ///
+    /// # Example
+    /// ```rust
+    /// use code_sandbox::{Result, SandboxBuilder};
+    ///
+    /// const PYTHON_CODE: &'static str = r#"
+    /// import sys
+    /// sys.exit(17)
+    /// "#;
+    ///
+    /// #[tokio::main]
+    /// async fn main() -> Result<()> {
+    ///     let mut builder = SandboxBuilder::new("dcchut/code-sandbox-python")?;
+    ///     builder.entry_point(["python3", "/app/main.py"]);
+    ///     builder.mount("/app/main.py", PYTHON_CODE)?;
+    ///
+    ///     let result = builder.build()?.execute().await?;
+    ///     assert_eq!(result.status().code().unwrap(), 17);
+    ///
+    ///     Ok(())
+    /// }
+    /// ```
     pub fn status(&self) -> ExitStatus {
         self.status
     }
@@ -336,22 +658,17 @@ fn basic_secure_docker_command(soft_timeout: Duration) -> Command {
         "--memory-swap",
         "512m",
         "--env",
-        format!(
-            "PLAYGROUND_TIMEOUT={}",
-            soft_timeout.as_secs()
-        ),
+        format!("PLAYGROUND_TIMEOUT={}", soft_timeout.as_secs()),
     );
 
-    if cfg!(feature = "fork-bomb-prevention") {
-        cmd.args(&["--pids-limit", "512"]);
-    }
-
     cmd.kill_on_drop(true);
-
     cmd
 }
 
-async fn run_command_with_timeout(mut command: Command, hard_timeout: Duration) -> Result<std::process::Output> {
+async fn run_command_with_timeout(
+    mut command: Command,
+    hard_timeout: Duration,
+) -> Result<std::process::Output> {
     let output = command
         .output()
         .await
@@ -371,10 +688,8 @@ async fn run_command_with_timeout(mut command: Command, hard_timeout: Duration) 
         .ok_or(Error::MissingCompilerId)?
         .trim();
 
-    // ----------
-
+    // Run the command for at most `hard_timeout`
     let mut command = docker_command!("wait", id);
-
     let timed_out = match tokio::time::timeout(hard_timeout, command.output()).await {
         Ok(Ok(o)) => {
             // Didn't time out, didn't fail to run
@@ -406,33 +721,31 @@ async fn run_command_with_timeout(mut command: Command, hard_timeout: Duration) 
                 Ok(ExitStatusExt::from_raw(code))
             }
         }
-        Ok(e) => return e.map_err(|e| Error::UnableToWaitForCompiler { source: e }), // Failed to run
-        Err(e) => Err(e),                                                            // Timed out
+        Ok(e) => return e.map_err(|e| Error::UnableToWaitForCompiler { source: e }),
+        Err(e) => Err(e),
     };
 
-    // ----------
-
+    // Obtain the output (roughly, stdout and stderr) of the container.
     let mut command = docker_command!("logs", id);
     let mut output = command
         .output()
         .await
         .map_err(|e| Error::UnableToGetOutputFromCompiler { source: e })?;
 
-    // ----------
-
-    let mut command = docker_command!(
-        "rm", // Kills container if still running
-        "--force", id
-    );
+    // Kill and remove the container if it's still running
+    let mut command = docker_command!("rm", "--force", id);
     command.stdout(std::process::Stdio::null());
     command
         .status()
         .await
         .map_err(|e| Error::UnableToRemoveCompiler { source: e })?;
 
-    let code = timed_out.map_err(|e| Error::CompilerExecutionTimedOut { source: e, timeout: hard_timeout })?;
-
-    output.status = code;
+    // Get the status code of the command running in the container
+    let status_code = timed_out.map_err(|e| Error::CompilerExecutionTimedOut {
+        source: e,
+        timeout: hard_timeout,
+    })?;
+    output.status = status_code;
 
     Ok(output)
 }
@@ -464,9 +777,10 @@ mod test {
     "#;
 
     async fn run_rust_sandbox<S: AsRef<str>>(code: S) -> CompletedSandbox {
-        let mut builder =
-            SandboxBuilder::new("dcchut/code-sandbox-rust-stable", vec!["cargo", "run"])
-                .expect("failed to build sandbox");
+        let mut builder = SandboxBuilder::new("dcchut/code-sandbox-rust-stable")
+            .expect("failed to build sandbox");
+        builder.entry_point(["cargo", "run"]);
+
         builder
             .mount("/playground/src/main.rs", code.as_ref().to_string())
             .expect("failed to mount code");
@@ -476,11 +790,10 @@ mod test {
     }
 
     async fn run_python_sandbox<S: AsRef<str>>(code: S) -> CompletedSandbox {
-        let mut builder = SandboxBuilder::new(
-            "dcchut/code-sandbox-python",
-            vec!["python3", "/playground/src/main.py"],
-        )
-        .expect("failed to build sandbox");
+        let mut builder =
+            SandboxBuilder::new("dcchut/code-sandbox-python").expect("failed to build sandbox");
+        builder.entry_point(["python3", "/playground/src/main.py"]);
+
         builder
             .mount("/playground/src/main.py", code.as_ref().to_string())
             .expect("failed to mount code");
@@ -490,12 +803,12 @@ mod test {
     }
 
     async fn run_haskell_sandbox<S: AsRef<str>>(code: S) -> CompletedSandbox {
-        let mut builder = SandboxBuilder::new(
-            "dcchut/code-sandbox-haskell",
-            vec!["cabal", "run", "-v0"]
-        ).expect("falied to build sandbox");
+        let mut builder =
+            SandboxBuilder::new("dcchut/code-sandbox-haskell").expect("falied to build sandbox");
+        builder.entry_point(["cabal", "run", "-v0"]);
 
-        builder.mount("/playground/Main.hs", code.as_ref().to_string())
+        builder
+            .mount("/playground/app/Main.hs", code.as_ref().to_string())
             .expect("failed to mount code");
 
         let sb = builder.build().expect("failed to build sandbox");
@@ -521,14 +834,17 @@ mod test {
     #[tokio::test]
     async fn basic_functionality_haskell() {
         let _singleton = one_test_at_a_time();
-        let response = run_haskell_sandbox(r#"
+        let response = run_haskell_sandbox(
+            r#"
         module Main where
 
         main :: IO ()
         main = do
             print "hello world!"
 
-        "#).await;
+        "#,
+        )
+        .await;
 
         // Note that haskell outputs the quotes around our string
         assert!(response.stdout.contains(r#""hello world!""#));
@@ -547,9 +863,9 @@ mod test {
     /// Tests the full end-to-end process, including file mounting, execution, and solution retrieval.,
     #[tokio::test]
     async fn test_sandbox_end_to_end() {
-        let mut builder =
-            SandboxBuilder::new("dcchut/code-sandbox-rust-stable", vec!["cargo", "run"])
-                .expect("failed to create builder");
+        let mut builder = SandboxBuilder::new("dcchut/code-sandbox-rust-stable")
+            .expect("failed to create builder");
+        builder.entry_point(["cargo", "run"]);
 
         builder
             .mount(
@@ -626,20 +942,21 @@ fn main() {
     #[tokio::test]
     async fn basic_functionality_hassssskell() {
         let _singleton = one_test_at_a_time();
-        let response = run_haskell_sandbox(r#"
+        let response = run_haskell_sandbox(
+            r#"
         module Main where
 
         main :: IO ()
         main = do
             print "hello world!"
 
-        "#).await;
+        "#,
+        )
+        .await;
 
         dbg!(&response);
 
         // Note that haskell outputs the quotes around our string
         assert!(response.stdout.contains(r#""hello world!""#));
     }
-
-
 }
