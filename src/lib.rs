@@ -1,14 +1,15 @@
 //! # code-sandbox
 //!
-//! A proof-of-concept library for creating temporary Docker containers for the purposes of running code.
-//! Some example use cases:
+//! A proof-of-concept library for creating temporary Docker containers for the purpose of running code.
+//!
+//! Some example use cases include:
 //! - A backend component of a code editor or submission system, or
 //! - To allow users of a Discord bot to run code.
 //!
 //! ## Docker images
 //!
-//! This repository contains a few Dockerfiles that are intended for use in a code sandbox.
-//! The provided images are:
+//! This repository contains a few Dockerfiles that can be used to create images
+//! intended for use in a code sandbox.  The provided images are:
 //!
 //! | Image                             | Environment description |
 //! |-----------------------------------|-------------------------|
@@ -17,6 +18,7 @@
 //! | `dcchut/code-sandbox-haskell`     | GHC 8.10.7              |
 //!
 //! ### Soft timeout wrapper
+//!
 //! Each image has a basic wrapper script responsible for enforcing a soft timeout:
 //!
 //! ```shell
@@ -31,27 +33,28 @@
 //! timeout --signal=KILL ${timeout} "$@"
 //! ```
 //!
-//! A hard timeout is enforced at the library level when the sandbox is being ran.
+//! A hard timeout is enforced at the library level while the sandbox is being run.
 //!
 //! ### Creating a new image
 //!
 //! Creating a new sandbox image is fairly straightforward: prepare a Dockerfile
-//! with the desired environment whose entry point is the wrapper script (seen above).
-//! Please feel free to put up a PR if you have a code sandbox to contribute or an
-//! update or fix to an existing sandbox!
+//! with the desired environment whose entry point is the wrapper script (see above).
+//! Please feel free to submit a PR if you have a new image to contribute or
+//! improvements to an existing image.
 //!
 //! *Tip*: Make sure to make use of the Docker cache to reduce compilation time
-//! inside the image!  For an example of this see the `dcchut/code-sandbox-rust` Dockerfile -
-//! build requirements are pre-compiled so that the image only has to pay the compilation
+//! inside the image!  For an example of this see `dcchut/code-sandbox-rust` -
+//! build requirements are pre-compiled so the image only has to pay the compilation
 //! cost of the code the user actually writes.
 //!
 //! ## `code-sandbox` crate
 //!
-//! This library is geared towards running short-lived Docker containers
-//! for the purposes of running code - it is not a general purpose library
-//! for interacting with Docker.
+//! As mentioned above, this library is geared towards running short-lived Docker containers
+//! for the purposes of running code - it is not a general purpose library for interacting
+//! with Docker.
 //!
 //! ### Running your first sandbox
+//!
 //! The following example shows mounting the `dcchut/code-sandbox-python` image
 //! and running some Python code in it:
 //!
@@ -94,8 +97,9 @@
 //! ```
 //!
 //! ### Reading the value of a mounted file.
-//! It is also possible to read the contents of a mounted file after the sandbox
-//! has been ran.
+//!
+//! It's also possible to mount a file within the sandbox, run the sandbox, then read the value of the mounted file
+//! once the sandbox has been run.
 //!
 //! ```rust
 //! use code_sandbox::{Result, SandboxBuilder};
@@ -132,7 +136,6 @@
 //!     Ok(())
 //! }
 //! ```
-//!
 //!
 use log::debug;
 use std::io::Read;
